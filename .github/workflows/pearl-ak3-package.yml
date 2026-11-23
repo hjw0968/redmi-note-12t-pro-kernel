@@ -1,0 +1,130 @@
+name: pearl AK3 package (from verified kernel artifact)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Successful pearl-sukisu.yml run ID (kernel only)'
+        required: true
+        type: string
+        default: '45192006344'
+      source_artifact:
+        description: 'Artifact from the successful run'
+        required: true
+        type: string
+        default: 'pearl-sukisu-kernel-1'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    name: Package pearl MIUI14 experimental kernel ZIP
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Download kernel from this repository's completed Actions run
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          name: ${{ inputs.source_artifact }}
+          path: input
+
+      - name: Verify exact kernel binary and build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd input
+          test -s Image && test -s Image.gz && test -s Module.symvers && test -s kernel.config
+          sha256sum -c SHA256SUMS
+          # This first experiment is deliberately tied to the already inspected Run #1.
+          echo '41af00adadbf8aae726f5958acb3fd529129667089e4bdbb8585195235ae4bd8  Image.gz' | sha256sum -c -
+          gzip -t Image.gz
+          gzip -cd Image.gz | cmp - Image
+          file Image | grep -q 'ARM64 boot executable'
+          grep -qx 'CONFIG_KSU=y' kernel.config
+          grep -qx 'CONFIG_MODVERSIONS=y' kernel.config
+          grep -qx 'CONFIG_CFI_CLANG=y' kernel.config
+          grep -qx 'CONFIG_LTO_CLANG_THIN=y' kernel.config
+          grep -qx '# CONFIG_USB_MTK_HDRC is not set' kernel.config
+          grep -q '^Source: Xiaomi pearl-s-oss d96c1a04b701bcf1d39ed1b8ab4b3137ff6490f9$' BUILD-INFO.txt
+          grep -q '^Device: Redmi Note 12T Pro (pearl)$' BUILD-INFO.txt
+
+      - name: Fetch pinned original AnyKernel3 framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/osm0sis/AnyKernel3.git ak3
+          git -C ak3 checkout --detach 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+          git -C ak3 rev-parse HEAD
+
+      - name: Build narrow, kernel-only A/B flash ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ak3
+          rm -rf .git README.md ramdisk patch modules vendor_ramdisk vendor_patch
+          cp ../input/Image.gz ./Image.gz
+          # Drop any example kernel payloads and optional partition images.
+          find . -maxdepth 1 -type f \
+            \( -name 'Image' -o -name 'Image.*-dtb' -o -name 'zImage*' -o -name '*.dtbo' -o -name 'dtb' -o -name 'dtbo.img' \) \
+            -delete
+          cat > anykernel.sh <<'SH'
+          ### Redmi Note 12T Pro (pearl) / MIUI 14 Android 13
+          ### Experimental device-source Image.gz, only active boot slot.
+          properties() { '
+          kernel.string=pearl SukiSU Nova 35084 (EXPERIMENTAL)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=pearl
+          supported.versions=13
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          boot_attributes() { :; }
+          BLOCK=boot;
+          IS_SLOT_DEVICE=1;
+          SLOT_SELECT=active;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=0;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          SH
+          cat > PEARL-READ-FIRST.txt <<'TXT'
+          EXPERIMENTAL - NOT TESTED ON MIUI 14.0.10.0.TLHCNXM
+          Device: Redmi Note 12T Pro (pearl), Android 13, A/B partitions.
+          Kernel: Xiaomi pearl-s-oss 5.10.136, SukiSU Nova 35084 built-in, no SUSFS/KPM.
+          This ZIP replaces the kernel in the ACTIVE boot partition only.
+          It does not modify vendor_boot, dtbo or vbmeta, and should preserve boot ramdisk.
+          No root modules or extra ramdisk patches are included.
+          STOP before flashing until vendor module CRC/KMI verification is completed for
+          your own MIUI 14.0.10 firmware. Passing GitHub Actions does NOT establish compatibility.
+          Keep a validated full backup of CURRENT boot_b and factory boot.img off-device.
+          APK / KernelSU frontend may choose the inactive slot for OTA: verify target is active.
+          TXT
+          bash -n anykernel.sh
+          test -s Image.gz && test -s tools/ak3-core.sh
+          ! grep -Eq 'BLOCK=(recovery|vendor_boot|dtbo)' anykernel.sh
+          mkdir -p ../output
+          zip -qr9 ../output/pearl-miui14-sukisu35084-UNTESTED-AnyKernel3.zip . \
+            -x '.git/*' '*/.git/*' '*.placeholder'
+          unzip -t ../output/pearl-miui14-sukisu35084-UNTESTED-AnyKernel3.zip | tail -1
+          unzip -l ../output/pearl-miui14-sukisu35084-UNTESTED-AnyKernel3.zip | grep -E 'anykernel.sh|Image.gz|tools/ak3-core.sh|PEARL-READ-FIRST'
+          (cd ../output && sha256sum ./*.zip > SHA256SUMS && sha256sum -c SHA256SUMS)
+          cp ../input/BUILD-INFO.txt ../output/BUILD-INFO.txt
+          cp ../input/SHA256SUMS ../output/KERNEL-SHA256SUMS.txt
+
+      - name: Upload UNTESTED AnyKernel3 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pearl-miui14-sukisu35084-UNTESTED-AK3
+          path: output/
+          if-no-files-found: error
+          retention-days: 14

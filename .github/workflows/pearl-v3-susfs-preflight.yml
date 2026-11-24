@@ -1,0 +1,192 @@
+name: pearl V3 - SUSFS adaptation preflight
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+    - name: Checkout pearl build project
+      uses: actions/checkout@v4
+      with:
+        ref: 0719aa51a776f28f69c172d222dfd7ab67d8933b
+        persist-credentials: false
+    - name: Download V2 reference
+      uses: actions/download-artifact@v4
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        run-id: '45301396517'
+        name: pearl-V2-KPM-build-1
+        path: v2-reference
+    - name: Verify V2 reference
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd v2-reference
+        sha256sum -c SHA256SUMS
+        grep -qx 'CONFIG_KSU=y' kernel.config
+        grep -qx 'CONFIG_KPM=y' kernel.config
+        grep -Fq '8350b500' BUILD-INFO.txt
+    - name: Free runner disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+        df -h
+    - name: Install reproducible Clang 12 toolchain and build tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          clang-12 lld-12 llvm-12 make bc bison flex libssl-dev libelf-dev \
+          python3 python3-distutils python-is-python3 xz-utils cpio tar \
+          kmod curl git file binutils patch binutils-aarch64-linux-gnu \
+          gcc-aarch64-linux-gnu zip unzip
+        mkdir -p "$HOME/llvm12/bin"
+        for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
+                 llvm-objdump llvm-readelf llvm-size llvm-strip llvm-ranlib; do
+          src="$(command -v "${t}-12" || true)"
+          test -n "$src" || { echo "Missing tool ${t}-12"; exit 1; }
+          ln -sf "$src" "$HOME/llvm12/bin/$t"
+        done
+        echo "$HOME/llvm12/bin" >> "$GITHUB_PATH"
+    - name: Fetch pinned Xiaomi pearl-s-oss sources
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fL --retry 3 -o /tmp/pearl-s-oss.tar.gz \
+          https://codeload.github.com/MiCode/Xiaomi_Kernel_OpenSource/tar.gz/d96c1a04b701bcf1d39ed1b8ab4b3137ff6490f9
+        mkdir -p /tmp/pearl-source-unpacked
+        tar -xzf /tmp/pearl-s-oss.tar.gz -C /tmp/pearl-source-unpacked
+        src="$(find /tmp/pearl-source-unpacked -mindepth 1 -maxdepth 1 -type d | head -1)"
+        test -n "$src" && mv "$src" /tmp/pearl-kernel
+        grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' /tmp/pearl-kernel/Makefile
+    - name: Fetch pinned compatible upstream pair and integrate builtin source
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$GITHUB_WORKSPACE/dist"
+        cd /tmp/pearl-kernel
+        git clone --branch builtin https://github.com/SukiSU-Nova/SukiSU-Nova.git KernelSU
+        git -C KernelSU checkout -B builtin 4bec532dd447e2852aa8932afa768255350c103a
+        test "$(git -C KernelSU rev-parse HEAD)" = 4bec532dd447e2852aa8932afa768255350c103a
+        # The tested V1 setup used the same drivers link and Kbuild/Kconfig entries.
+        ln -s ../KernelSU/kernel drivers/kernelsu
+        printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+        sed -i '/^endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        grep -Eq '^config[[:space:]]+KSU_SUSFS$' drivers/kernelsu/Kconfig
+        grep -Eq '^config[[:space:]]+KPM$' drivers/kernelsu/Kconfig
+        git clone --branch gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
+        git -C /tmp/susfs4ksu checkout --detach 784ac9e6fd49bb02499b5b60c57ccc9d0c680204
+        test "$(git -C /tmp/susfs4ksu rev-parse HEAD)" = 784ac9e6fd49bb02499b5b60c57ccc9d0c680204
+        {
+          echo 'Device: Redmi Note 12T Pro (pearl), MIUI 14 / Android 13'
+          echo 'Xiaomi: d96c1a04b701bcf1d39ed1b8ab4b3137ff6490f9'
+          echo 'Nova builtin: 4bec532dd447e2852aa8932afa768255350c103a'
+          echo 'SUSFS android12-5.10: 784ac9e6fd49bb02499b5b60c57ccc9d0c680204'
+          echo 'Pair published together in zzh20188/GKI_KernelSU_SUSFS v2.4.0-r3 (generic GKI only)'
+          echo 'V2 reference: 45301396517'
+          echo 'No KPM binary patch; no flashable ZIP in this preflight'
+        } > "$GITHUB_WORKSPACE/dist/BUILD-INFO.txt"
+    - name: Strict kernel-side patch preflight (no partial success)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd /tmp/pearl-kernel
+        report="$GITHUB_WORKSPACE/dist"
+        patchfile=/tmp/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
+        test -s "$patchfile"
+        cp "$patchfile" "$report/upstream-susfs.patch"
+        # Use a disposable source tree. Do not use the legacy driver-side 10_enable patch.
+        cp /tmp/susfs4ksu/kernel_patches/fs/* fs/
+        cp /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+        if ! patch --dry-run --batch --forward --fuzz=0 -p1 < "$patchfile" 2>&1 | tee "$report/patch-dry-run.log"; then
+          echo 'FAIL: exact patch context does not match pearl; collecting rejects only.' | tee "$report/PREFLIGHT-STATUS.txt"
+          set +e
+          patch --batch --forward --fuzz=0 -p1 < "$patchfile" > "$report/patch-reject.log" 2>&1
+          rc=$?
+          set -e
+          find . -type f -name '*.rej' -print0 | tar --null -T - -czf "$report/rejects.tar.gz"
+          echo "Diagnostic patch exit status: $rc" >> "$report/PREFLIGHT-STATUS.txt"
+          exit 1
+        fi
+        patch --batch --forward --fuzz=0 -p1 < "$patchfile" 2>&1 | tee "$report/patch-apply.log"
+        if find . -type f -name '*.rej' -print -quit | grep -q .; then exit 1; fi
+        echo 'PASS: exact context patch applied; API/runtime not yet validated.' | tee "$report/PREFLIGHT-STATUS.txt"
+    - name: Build V3 candidate only after patch preflight
+      shell: bash
+      run: |
+        set -euo pipefail
+        cp configs/device_kconfig.txt /tmp/pearl-v3.config
+        cat >> /tmp/pearl-v3.config <<'EOF'
+        CONFIG_KSU=y
+        CONFIG_KPM=y
+        CONFIG_KSU_SUSFS=y
+        # CONFIG_KSU_DEBUG is not set
+        EOF
+        THIN_LTO=1 TARGET=Image.gz JOBS=2 LOCALVERSION=-pearl-sukisu \
+          scripts/build-kernel.sh /tmp/pearl-kernel /tmp/pearl-v3.config 2>&1 | tee dist/build.log
+        cfg=/tmp/pearl-kernel/out/.config
+        cp "$cfg" dist/kernel.config
+        for option in KSU KPM KSU_SUSFS KALLSYMS KALLSYMS_ALL MODVERSIONS CFI_CLANG LTO_CLANG_THIN THREAD_INFO_IN_TASK; do
+          grep -qx "CONFIG_${option}=y" "$cfg" || { echo "Required config missing: $option"; exit 1; }
+        done
+        cp /tmp/pearl-kernel/out/arch/arm64/boot/{Image,Image.gz} dist/
+        cp /tmp/pearl-kernel/out/Module.symvers dist/
+        gzip -t dist/Image.gz
+        gzip -cd dist/Image.gz | cmp - dist/Image
+        (cd dist && sha256sum Image Image.gz Module.symvers kernel.config > SHA256SUMS)
+    - name: Compare V3 exports and config against working V2
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PYCRC' | tee dist/V2-V3-COMPATIBILITY.txt
+        from pathlib import Path
+        import re
+
+        def cfg(path):
+            values = {}
+            for line in Path(path).read_text().splitlines():
+                m = re.fullmatch(r'(CONFIG_\w+)=(.*)', line)
+                if m: values[m[1]] = m[2]
+                else:
+                    m = re.fullmatch(r'# (CONFIG_\w+) is not set', line)
+                    if m: values[m[1]] = 'n'
+            return values
+
+        def symbols(path):
+            result = {}
+            for line in Path(path).read_text().splitlines():
+                f = line.split()
+                if len(f) >= 2 and f[0].startswith('0x'):
+                    result[f[1]] = f[0].lower()
+            if not result: raise SystemExit('Empty symbol table')
+            return result
+
+        a, b = cfg('v2-reference/kernel.config'), cfg('dist/kernel.config')
+        changes = [(k,a.get(k),b.get(k)) for k in sorted(a.keys() | b.keys()) if a.get(k)!=b.get(k)]
+        print('All config differences:', *changes, sep='\n')
+        unexpected = [x for x in changes if not x[0].startswith('CONFIG_KSU_')]
+        x,y = symbols('v2-reference/Module.symvers'), symbols('dist/Module.symvers')
+        missing = sorted(x.keys()-y.keys())
+        changed = [(k,x[k],y[k]) for k in sorted(x.keys() & y.keys()) if x[k]!=y[k]]
+        print('Missing exports:', len(missing), missing)
+        print('Changed CRCs:', len(changed), changed)
+        print('New exports:',len(y.keys()-x.keys()))
+        print('Non-KSU configuration changes:', unexpected)
+        if unexpected or missing or changed:
+            raise SystemExit('Review gate: config/CRC drift; inspect report before further development')
+        print('PASS: reference export/config gate; NOT runtime compatibility or KPM activation')
+        PYCRC
+    - name: Upload preflight reports and build candidates (not flashable)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pearl-V3-SUSFS-preflight-${{ github.run_number }}
+        path: dist/
+        if-no-files-found: warn
+        retention-days: 30

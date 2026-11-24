@@ -1,6 +1,10 @@
 name: pearl V3 - SUSFS adaptation preflight
 'on':
   workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pearl-v3-susfs-preflight.yml'
 permissions:
   contents: read
   actions: read

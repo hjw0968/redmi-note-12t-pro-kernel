@@ -148,6 +148,24 @@ jobs:
         patch --batch --forward --fuzz=0 -p1 < "$patchfile" 2>&1 | tee "$report/patch-apply.log"
         if find . -type f -name '*.rej' -print -quit | grep -q .; then exit 1; fi
         echo 'PASS: exact context patch applied; API/runtime not yet validated.' | tee "$report/PREFLIGHT-STATUS.txt"
+        # pearl 5.10.136 predates Android's VMA padding API.
+        # The original pearl show_map_vma() uses vm_end. Apply the same
+        # compatibility fallback used by LingLuo17/AnyKernel3 v2.4.0-r4.
+        if grep -RqsE '^[[:space:]]*#[[:space:]]*define[[:space:]]+VMA_PAD_START([[:space:]]|\()' include arch/arm64/include; then
+          echo 'VMA_PAD_START exists; refusing legacy fallback' >&2
+          exit 1
+        fi
+        python3 - <<'PYVMA' | tee "$report/pearl-vma-compat.log"
+        from pathlib import Path
+        p = Path('fs/proc/task_mmu.c')
+        s = p.read_text()
+        old = 'end = VMA_PAD_START(vma);'
+        new = 'end = vma->vm_end;'
+        if s.count(old) != 1:
+            raise SystemExit('Expected exactly one VMA_PAD_START assignment')
+        p.write_text(s.replace(old, new, 1))
+        print('PASS: restored legacy VMA end boundary in fs/proc/task_mmu.c')
+        PYVMA
     - name: Build V3 candidate only after patch preflight
       shell: bash
       run: |

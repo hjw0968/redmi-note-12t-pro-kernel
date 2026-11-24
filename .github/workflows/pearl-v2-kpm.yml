@@ -1,0 +1,262 @@
+name: pearl V2 - SukiSU 35084 + KPM
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+    - name: Checkout pearl build project
+      uses: actions/checkout@v4
+      with:
+        ref: 0719aa51a776f28f69c172d222dfd7ab67d8933b
+        persist-credentials: false
+    - name: Download frozen V1 baseline
+      uses: actions/download-artifact@v4
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        run-id: '45192006344'
+        name: pearl-sukisu-kernel-1
+        path: v1-reference
+    - name: Verify V1 reference hashes
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd v1-reference
+        sha256sum -c SHA256SUMS
+        printf '%s  %s\n' '9516f41252acbda16ae5f33809bad48963ab72911c3b47434f6207396bd67261' Module.symvers 'a5d176f210cf38adbc9bb713d21405a57c254b8047f03260cbb8aff88680ade6' kernel.config | sha256sum -c -
+        grep -qx '# CONFIG_KPM is not set' kernel.config
+    - name: Free runner disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+        df -h
+    - name: Install reproducible Clang 12 toolchain and build tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          clang-12 lld-12 llvm-12 make bc bison flex libssl-dev libelf-dev \
+          python3 python3-distutils python-is-python3 xz-utils cpio tar \
+          kmod curl git file binutils patch binutils-aarch64-linux-gnu \
+          gcc-aarch64-linux-gnu zip unzip
+        mkdir -p "$HOME/llvm12/bin"
+        for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
+                 llvm-objdump llvm-readelf llvm-size llvm-strip llvm-ranlib; do
+          src="$(command -v "${t}-12" || true)"
+          test -n "$src" || { echo "Missing tool ${t}-12"; exit 1; }
+          ln -sf "$src" "$HOME/llvm12/bin/$t"
+        done
+        echo "$HOME/llvm12/bin" >> "$GITHUB_PATH"
+    - name: Fetch pinned Xiaomi pearl-s-oss sources
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fL --retry 3 -o /tmp/pearl-s-oss.tar.gz \
+          https://codeload.github.com/MiCode/Xiaomi_Kernel_OpenSource/tar.gz/d96c1a04b701bcf1d39ed1b8ab4b3137ff6490f9
+        mkdir -p /tmp/pearl-source-unpacked
+        tar -xzf /tmp/pearl-s-oss.tar.gz -C /tmp/pearl-source-unpacked
+        src="$(find /tmp/pearl-source-unpacked -mindepth 1 -maxdepth 1 -type d | head -1)"
+        test -n "$src" && mv "$src" /tmp/pearl-kernel
+        grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' /tmp/pearl-kernel/Makefile
+    - name: Integrate V1 SukiSU revision and enable only KPM
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd /tmp/pearl-kernel
+        curl -fL --retry 3 \
+          https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh \
+          -o /tmp/sukisu-setup.sh
+        bash /tmp/sukisu-setup.sh main
+        # Resolve the V1 commit prefix recorded by the successful build; fail closed if absent.
+        # Keep the local branch name main for the upstream version calculation.
+        ksu_commit="$(git -C KernelSU rev-parse --verify '8350b500^{commit}')"
+        git -C KernelSU checkout -B main "$ksu_commit"
+        test "$(git -C KernelSU rev-parse HEAD)" = "$ksu_commit"
+        printf '%s\n' "$ksu_commit" > /tmp/pearl-sukisu-commit
+
+        if [ -L drivers/kernelsu ]; then
+          echo "SukiSU source link: $(readlink -f drivers/kernelsu)"
+        fi
+        test -e drivers/kernelsu/Kconfig || { echo 'SukiSU integration failed'; exit 1; }
+        cp "$GITHUB_WORKSPACE/configs/device_kconfig.txt" /tmp/pearl-sukisu.config
+        cat >> /tmp/pearl-sukisu.config <<'EOF'
+        CONFIG_KSU=y
+        CONFIG_KPM=y
+        # CONFIG_KSU_DEBUG is not set
+        EOF
+    - name: Build V2 kernel with V1 toolchain and configuration
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$GITHUB_WORKSPACE/dist"
+        set -o pipefail
+        THIN_LTO=1 TARGET=Image.gz JOBS=2 LOCALVERSION=-pearl-sukisu \
+          scripts/build-kernel.sh /tmp/pearl-kernel /tmp/pearl-sukisu.config \
+          2>&1 | tee "$GITHUB_WORKSPACE/dist/build.log"
+        cfg=/tmp/pearl-kernel/out/.config
+        grep -qx 'CONFIG_KSU=y' "$cfg"
+        grep -qx 'CONFIG_KPM=y' "$cfg"
+        grep -qx 'CONFIG_KALLSYMS=y' "$cfg"
+        grep -qx 'CONFIG_KALLSYMS_ALL=y' "$cfg"
+        grep -qx 'CONFIG_64BIT=y' "$cfg"
+        grep -qx 'CONFIG_CFI_CLANG=y' "$cfg"
+        grep -qx 'CONFIG_LTO_CLANG_THIN=y' "$cfg"
+        grep -qx '# CONFIG_USB_MTK_HDRC is not set' "$cfg"
+        if grep -qE '^CONFIG_(KSU_)?SUSFS=y' "$cfg"; then echo 'Unexpected SUSFS config'; exit 1; fi
+        grep -Fq 'SukiSU version: 35084' "$GITHUB_WORKSPACE/dist/build.log"
+        grep -Fq '8350b500' "$GITHUB_WORKSPACE/dist/build.log"
+        grep -qx 'CONFIG_MODVERSIONS=y' "$cfg" || { echo 'CONFIG_MODVERSIONS missing'; exit 1; }
+        cp /tmp/pearl-kernel/out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/dist/Image"
+        cp /tmp/pearl-kernel/out/arch/arm64/boot/Image.gz "$GITHUB_WORKSPACE/dist/Image.gz"
+        cp /tmp/pearl-kernel/out/Module.symvers "$GITHUB_WORKSPACE/dist/Module.symvers"
+        cp "$cfg" "$GITHUB_WORKSPACE/dist/kernel.config"
+        (cd "$GITHUB_WORKSPACE/dist" && sha256sum Image Image.gz Module.symvers kernel.config > SHA256SUMS)
+        {
+          echo 'Device: Redmi Note 12T Pro (pearl)'
+          echo 'Source: Xiaomi pearl-s-oss d96c1a04b701bcf1d39ed1b8ab4b3137ff6490f9'
+          echo 'V2: SukiSU Nova 35084, CONFIG_KSU=y, CONFIG_KPM=y'
+          printf 'SukiSU commit: %s\n' "$(cat /tmp/pearl-sukisu-commit)"
+          echo 'SUSFS: disabled; KPM binary patch: not applied'
+          echo 'Compiler: Clang 12; ThinLTO; MODVERSIONS'
+          clang --version
+          echo 'V1 build run: 45192006344'
+        } > "$GITHUB_WORKSPACE/dist/BUILD-INFO.txt"
+    - name: Gate V2 against V1 config and exported-symbol CRC baseline
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PYCRC' | tee dist/V1-V2-COMPATIBILITY.txt
+        from pathlib import Path
+        import re, sys
+
+        def config(path):
+            result = {}
+            for line in Path(path).read_text().splitlines():
+                m = re.fullmatch(r'(CONFIG_\w+)=(.*)', line)
+                if m:
+                    result[m[1]] = m[2]
+                else:
+                    m = re.fullmatch(r'# (CONFIG_\w+) is not set', line)
+                    if m:
+                        result[m[1]] = 'n'
+            return result
+
+        def symbols(path):
+            result = {}
+            for line in Path(path).read_text().splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and fields[0].startswith('0x'):
+                    result[fields[1]] = fields[0].lower()
+            if not result:
+                raise SystemExit('Empty symbol table: ' + str(path))
+            return result
+
+        old, new = config('v1-reference/kernel.config'), config('dist/kernel.config')
+        changes = [(k, old.get(k), new.get(k)) for k in sorted(old.keys() | new.keys()) if old.get(k) != new.get(k)]
+        print('Config changes:', changes)
+        # Only KPM and any newly exposed KPM-only settings are intended. Fail on other drift.
+        unexpected = [(k,a,b) for k,a,b in changes if not (k == 'CONFIG_KPM' or k.startswith('CONFIG_KPM_'))]
+        a,b = symbols('v1-reference/Module.symvers'),symbols('dist/Module.symvers')
+        missing = sorted(a.keys()-b.keys())
+        mismatch = sorted(k for k in a.keys() & b.keys() if a[k] != b[k])
+        print('V1 exported symbols:',len(a),'V2 exported symbols:',len(b))
+        print('Missing V1 symbols:',len(missing), missing[:100])
+        print('Changed V1 symbol CRCs:',len(mismatch),[(k,a[k],b[k]) for k in mismatch[:100]])
+        print('Added exports:',len(b.keys()-a.keys()))
+        print('Unexpected config changes:',unexpected)
+        if unexpected or missing or mismatch:
+            sys.exit('ABI/config gate failed; inspect report before packaging')
+        print('PASS: V1 export CRCs and non-KPM config preserved. Not proof of all vendor module or runtime compatibility.')
+        PYCRC
+    - name: Fetch pinned original AnyKernel3 framework
+      shell: bash
+      run: |
+        set -euo pipefail
+        git clone https://github.com/osm0sis/AnyKernel3.git ak3
+        git -C ak3 checkout --detach 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+        git -C ak3 rev-parse HEAD
+    - name: Package V2 with the V1-tested AnyKernel3 layout
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd ak3
+        (cd ../dist && sha256sum -c SHA256SUMS)
+        gzip -t ../dist/Image.gz
+        gzip -cd ../dist/Image.gz | cmp - ../dist/Image
+        file ../dist/Image | grep -q "ARM64 boot executable"
+        rm -rf .git README.md ramdisk patch modules vendor_ramdisk vendor_patch
+        cp ../dist/Image.gz ./Image.gz
+        # Drop any example kernel payloads and optional partition images.
+        find . -maxdepth 1 -type f \
+          \( -name 'Image' -o -name 'Image.*-dtb' -o -name 'zImage*' -o -name '*.dtbo' -o -name 'dtb' -o -name 'dtbo.img' \) \
+          -delete
+        cat > anykernel.sh <<'SH'
+        ### Redmi Note 12T Pro (pearl) / MIUI 14 Android 13
+        ### Experimental device-source Image.gz, only active boot slot.
+        properties() { '
+        kernel.string=pearl V2 SukiSU Nova 35084 + KPM (UNTESTED)
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=0
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=pearl
+        supported.versions=13
+        supported.patchlevels=
+        supported.vendorpatchlevels=
+        '; }
+        boot_attributes() { :; }
+        BLOCK=boot;
+        IS_SLOT_DEVICE=1;
+        SLOT_SELECT=active;
+        RAMDISK_COMPRESSION=auto;
+        PATCH_VBMETA_FLAG=0;
+        . tools/ak3-core.sh;
+        split_boot;
+        flash_boot;
+        SH
+        cat > PEARL-READ-FIRST.txt <<'TXT'
+        EXPERIMENTAL - NOT TESTED ON MIUI 14.0.10.0.TLHCNXM
+        Device: Redmi Note 12T Pro (pearl), Android 13, A/B partitions.
+        Kernel: Xiaomi pearl-s-oss 5.10.136, SukiSU Nova 35084 built-in, KPM enabled, binary patch not applied, no SUSFS.
+        This ZIP replaces the kernel in the ACTIVE boot partition only.
+        It does not modify vendor_boot, dtbo or vbmeta, and should preserve boot ramdisk.
+        No root modules or extra ramdisk patches are included.
+        V1 export CRC comparison is not full vendor-module verification.
+        Passing GitHub Actions does NOT establish V2 runtime compatibility.
+        Keep a validated full backup of CURRENT boot_b and factory boot.img off-device.
+        APK / KernelSU frontend may choose the inactive slot for OTA: verify target is active.
+        TXT
+        bash -n anykernel.sh
+        test -s Image.gz && test -s tools/ak3-core.sh
+        if grep -Eq 'BLOCK=(recovery|vendor_boot|dtbo)' anykernel.sh; then exit 1; fi
+        mkdir -p ../output
+        zip -qr9 ../output/pearl-miui14-V2-sukisu35084-KPM-UNTESTED-AnyKernel3.zip . \
+          -x '.git/*' '*/.git/*' '*.placeholder'
+        unzip -p ../output/pearl-miui14-V2-sukisu35084-KPM-UNTESTED-AnyKernel3.zip Image.gz | cmp - ../dist/Image.gz
+        unzip -t ../output/pearl-miui14-V2-sukisu35084-KPM-UNTESTED-AnyKernel3.zip | tail -1
+        unzip -l ../output/pearl-miui14-V2-sukisu35084-KPM-UNTESTED-AnyKernel3.zip | grep -E 'anykernel.sh|Image.gz|tools/ak3-core.sh|PEARL-READ-FIRST'
+        (cd ../output && sha256sum ./*.zip > SHA256SUMS && sha256sum -c SHA256SUMS)
+        cp ../dist/BUILD-INFO.txt ../output/BUILD-INFO.txt
+        cp ../dist/SHA256SUMS ../output/KERNEL-SHA256SUMS.txt
+        cp ../dist/V1-V2-COMPATIBILITY.txt ../output/V1-V2-COMPATIBILITY.txt
+    - name: Upload V2 flash ZIP and validation report
+      uses: actions/upload-artifact@v4
+      with:
+        name: pearl-miui14-V2-KPM-UNTESTED-AK3
+        path: output/
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload V2 build outputs and logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pearl-V2-KPM-build-${{ github.run_number }}
+        path: dist/
+        if-no-files-found: warn
+        retention-days: 30

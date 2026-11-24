@@ -101,6 +101,33 @@ jobs:
         patchfile=/tmp/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
         test -s "$patchfile"
         cp "$patchfile" "$report/upstream-susfs.patch"
+        # Adapt only the two exact rejected contexts from the pinned upstream patch.
+        cp "$patchfile" /tmp/pearl-susfs-adapted.patch
+        patchfile=/tmp/pearl-susfs-adapted.patch
+        python3 - "$patchfile" <<'PYADAPT'
+        from pathlib import Path
+        import hashlib
+        import sys
+        p=Path(sys.argv[1]); original=p.read_bytes()
+        assert hashlib.sha256(original).hexdigest() == 'bc7b152944cf13384f17238df43fc3c97025c254b61e47afb9864cca1051e041', 'Unexpected upstream SUSFS patch digest'
+        s=original.decode('utf-8')
+        # Scope adjustments to two exact upstream hunks; keep all added lines unchanged.
+        def adapt(section, header, old, new):
+            global s
+            marker='diff --git a/'+section+' b/'+section+'\n'
+            assert s.count(marker)==1,section
+            start=s.index(marker); end=s.find('\ndiff --git ',start+len(marker)); end=len(s) if end<0 else end
+            chunk=s[start:end]; h=chunk.index(header); stop=chunk.find('\n@@ ',h+len(header)); stop=len(chunk) if stop<0 else stop
+            part=chunk[h:stop]; assert part.count(old)==1,(section,header)
+            changed=part.replace(old,new,1)
+            assert [l for l in changed.splitlines() if l.startswith('+')]==[l for l in part.splitlines() if l.startswith('+')], 'Added lines changed'
+            s=s[:start]+chunk[:h]+changed+chunk[stop:]+s[end:]
+        adapt('fs/proc/task_mmu.c','@@ -906,6 +944,13 @@ static int show_smap', ' \tif (!vma_pages(vma))',' \tsmap_gather_stats(vma, &mss, 0);')
+        adapt('kernel/sys.c','@@ -646,6 +661,10 @@ long __sys_setresuid', ' \tkuid_t kruid, keuid, ksuid;\n \tbool ruid_new, euid_new, suid_new;', ' \tint retval;\n \tkuid_t kruid, keuid, ksuid;')
+        p.write_text(s,encoding='utf-8')
+        print('Adapted two pinned hunks; original additions unchanged.')
+        PYADAPT
+        cp "$patchfile" "$report/pearl-adapted-susfs.patch"
         # Use a disposable source tree. Do not use the legacy driver-side 10_enable patch.
         cp /tmp/susfs4ksu/kernel_patches/fs/* fs/
         cp /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
